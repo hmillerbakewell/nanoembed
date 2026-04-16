@@ -31,8 +31,8 @@ from evaluate.miracl import MiraclEvalSet, load_miracl
 from evaluate.results import Run, RunResult
 
 
-# 15 MIRACL languages excluding English. English corpus (~30 GB) is deferred to Colab.
-ALL_MIRACL_NON_EN: tuple[str, ...] = (
+# 15 non-English MIRACL languages. English (~30 GB corpus) excluded by default.
+DEFAULT_LANGUAGES: tuple[str, ...] = (
     "ar", "bn", "es", "fa", "fi", "fr", "hi", "id",
     "ja", "ko", "ru", "sw", "te", "th", "zh",
 )
@@ -250,7 +250,7 @@ def main() -> None:
 
     # Resolve language list
     if args.languages == ["all"]:
-        languages = list(ALL_MIRACL_NON_EN)
+        languages = list(DEFAULT_LANGUAGES)
     else:
         languages = list(args.languages)
 
@@ -269,7 +269,7 @@ def main() -> None:
     mode_label = args.mode
     if len(languages) == 1:
         lang_label = languages[0]
-    elif len(languages) == len(ALL_MIRACL_NON_EN):
+    elif len(languages) == len(DEFAULT_LANGUAGES):
         lang_label = "all"
     else:
         lang_label = "+".join(languages)
