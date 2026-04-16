@@ -109,10 +109,17 @@ def load_any_model(path_or_id: str) -> tuple[str, Encoder, float]:
         nm = nanoembed.load(str(p))
         return p.stem, nm.encode, nm.info.logical_size_mb
 
-    # HuggingFace model2vec
+    # HuggingFace model2vec (already has org/name format)
     from evaluate.encoders import make_m2v_native_encoder
     encoder, size_mb = make_m2v_native_encoder(path_or_id)
     return path_or_id, encoder, size_mb
+
+
+def _mteb_model_name(name: str) -> str:
+    """Ensure model name has org/name format for MTEB."""
+    if "/" in name:
+        return name
+    return f"nanoembed/{name}"
 
 
 def _score_with_mteb(
@@ -205,7 +212,7 @@ def main() -> None:
         run.log(f"\n--- {name} ({size_mb:.1f} MB) ---")
         t0 = time.perf_counter()
 
-        wrapper = MTEBModelWrapper(encoder, model_name=name, size_mb=size_mb)
+        wrapper = MTEBModelWrapper(encoder, model_name=_mteb_model_name(name), size_mb=size_mb)
         scores = _score_with_mteb(wrapper, tasks, results_dir / name.replace("/", "_"))
         elapsed = time.perf_counter() - t0
 
