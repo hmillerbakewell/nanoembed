@@ -1,19 +1,10 @@
-"""Evaluate compressed checkpoints on MTEB English tasks.
-
-Matches blobbybob's evaluation: STS + Classification + PairClassification.
-Produces per-task JSON results + a summary table.
+"""Evaluate static embedding models on MTEB tasks.
 
 Usage:
-    # Score all mxbai-compressed checkpoints on STS only (fast, ~5 min/model)
-    python run_mteb_eval.py --checkpoint "checkpoints/mxbai-compressed/*.pt" --tasks sts
-
-    # Score on the full blobbybob-matched task set (~30 min/model)
-    python run_mteb_eval.py --checkpoint "checkpoints/mxbai-compressed/*.pt" --tasks blobbybob
-
-    # Also include the original blobbybob-micro for head-to-head
-    python run_mteb_eval.py --checkpoint "checkpoints/mxbai-compressed/*.pt" \\
-        --include-m2v blobbybob/potion-mxbai-micro \\
-        --tasks blobbybob
+    python run_eval_mteb.py --model model.npz --tasks sts
+    python run_eval_mteb.py --model model.npz checkpoint.pt org/model-name --tasks blobbybob
+    python run_eval_mteb.py --model model.npz --tasks eng-v2
+    python run_eval_mteb.py --model model.npz --tasks multilingual
 """
 
 
@@ -24,8 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from evaluate.metrics import make_local_encoder
-from models.io import load_model
+from evaluate.metrics import Encoder
 from evaluate.mteb_adapter import MTEBModelWrapper
 from evaluate.results import Run, RunResult
 
@@ -96,6 +86,35 @@ def _resolve_tasks(task_set: str):
     return mteb.get_tasks(tasks=TASK_SETS[task_set])
 
 
+def load_any_model(path_or_id: str) -> tuple[str, Encoder, float]:
+    """Load a model from any supported source.
+
+    Returns (name, encoder_callable, size_mb).
+
+    - .pt file  → pytorch checkpoint
+    - .npz file → nanoembed packed format
+    - otherwise → model2vec from HuggingFace
+    """
+    p = Path(path_or_id)
+
+    if p.suffix == ".pt" and p.exists():
+        from evaluate.metrics import make_local_encoder
+        from models.io import load_model
+        model = load_model(p)
+        encoder = make_local_encoder(model, max_length=256)
+        return p.stem, encoder, model.size_mb
+
+    if p.suffix == ".npz" and p.exists():
+        import nanoembed
+        nm = nanoembed.load(str(p))
+        return p.stem, nm.encode, nm.info.logical_size_mb
+
+    # HuggingFace model2vec
+    from evaluate.encoders import make_m2v_native_encoder
+    encoder, size_mb = make_m2v_native_encoder(path_or_id)
+    return path_or_id, encoder, size_mb
+
+
 def _score_with_mteb(
     wrapper: MTEBModelWrapper,
     tasks,
@@ -128,44 +147,34 @@ def _score_with_mteb(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", nargs="+", default=[],
-                        help="Pipeline .pt checkpoint path(s) or glob(s)")
-    parser.add_argument("--nanoembed", nargs="*", default=[],
-                        help="Packed .npz model path(s) or glob(s)")
-    parser.add_argument("--tasks", default="sts", choices=ALL_TASK_CHOICES,
-                        help="Task set to evaluate (default: sts). "
-                             "eng-v2 and multilingual use MMTEB benchmarks.")
-    parser.add_argument("--include-m2v", nargs="*", default=[],
-                        help="model2vec model IDs to include as baselines")
-    parser.add_argument("--tag", default=None,
-                        help="Filter checkpoints by filename prefix")
+    parser = argparse.ArgumentParser(
+        description="Evaluate static embedding models on MTEB tasks",
+    )
+    parser.add_argument(
+        "--model", nargs="+", required=True,
+        help="Model(s) to evaluate: .pt checkpoint, .npz nanoembed file, "
+             "or HuggingFace model ID. Globs are expanded.",
+    )
+    parser.add_argument(
+        "--tasks", default="sts", choices=ALL_TASK_CHOICES,
+        help="Task set to evaluate (default: sts). "
+             "eng-v2 and multilingual use MMTEB benchmarks.",
+    )
     args = parser.parse_args()
 
     tasks = _resolve_tasks(args.tasks)
     task_names = [t.metadata.name for t in tasks]
 
-    # Expand globs for .pt checkpoints
-    paths: list[Path] = []
-    for pattern in args.checkpoint:
-        matches = sorted(Path(p) for p in glob(pattern))
-        if not matches:
-            print(f"Warning: no matches for {pattern}")
-        paths.extend(matches)
+    # Expand globs and resolve model specs
+    model_specs: list[str] = []
+    for pattern in args.model:
+        matches = sorted(glob(pattern))
+        if matches and matches != [pattern]:
+            model_specs.extend(matches)
+        else:
+            model_specs.append(pattern)
 
-    if args.tag:
-        prefix = f"{args.tag}_"
-        paths = [p for p in paths if p.stem.startswith(prefix)]
-
-    # Expand globs for .npz nanoembed models
-    nano_paths: list[Path] = []
-    for pattern in (args.nanoembed or []):
-        matches = sorted(Path(p) for p in glob(pattern))
-        if not matches:
-            print(f"Warning: no matches for {pattern}")
-        nano_paths.extend(matches)
-
-    if not paths and not nano_paths and not args.include_m2v:
+    if not model_specs:
         raise SystemExit("No models to evaluate")
 
     run = Run(
@@ -174,26 +183,30 @@ def main() -> None:
             "kind": "mteb_eval",
             "task_set": args.tasks,
             "task_names": task_names,
-            "num_checkpoints": len(paths),
-            "m2v_baselines": args.include_m2v,
+            "models": model_specs,
         },
     )
-    run.log(f"Task set:      {args.tasks} ({len(task_names)} tasks)")
-    run.log(f"Checkpoints:   {len(paths)}")
-    run.log(f"M2V baselines: {args.include_m2v or 'none'}")
-    run.log(f"Run directory:  {run.dir}")
+    run.log(f"Task set:   {args.tasks} ({len(task_names)} tasks)")
+    run.log(f"Models:     {len(model_specs)}")
+    run.log(f"Run dir:    {run.dir}")
 
     results_dir = run.dir / "mteb_results"
 
-    # ── Score local checkpoints ──────────────────────────────────────────────
-    for path in paths:
-        run.log(f"\n--- {path.stem} ---")
-        t0 = time.perf_counter()
-        model = load_model(path)
-        encoder = make_local_encoder(model, max_length=256)
-        wrapper = MTEBModelWrapper(encoder, model_name="healthdataavatar/"+path.stem, size_mb=model.size_mb)
+    for spec in model_specs:
+        try:
+            name, encoder, size_mb = load_any_model(spec)
+        except Exception as e:
+            import traceback
+            run.log(f"\n--- {spec} ---")
+            run.log(f"  failed to load: {e}")
+            traceback.print_exc()
+            continue
 
-        scores = _score_with_mteb(wrapper, tasks, results_dir / path.stem)
+        run.log(f"\n--- {name} ({size_mb:.1f} MB) ---")
+        t0 = time.perf_counter()
+
+        wrapper = MTEBModelWrapper(encoder, model_name=name, size_mb=size_mb)
+        scores = _score_with_mteb(wrapper, tasks, results_dir / name.replace("/", "_"))
         elapsed = time.perf_counter() - t0
 
         avg = float(np.mean(list(scores.values()))) if scores else 0.0
@@ -203,60 +216,10 @@ def main() -> None:
 
         flat = {"mteb_avg": avg, "eval_s": elapsed, **scores}
         run.add_result(RunResult(
-            name=path.stem,
-            size_mb=model.size_mb,
-            metrics=flat,
-            provenance=model.provenance,
+            name=name, size_mb=size_mb, metrics=flat, provenance=[name],
         ))
 
-    # ── Score nanoembed models ────────────────────────────────────────────────
-    for np_path in nano_paths:
-        run.log(f"\n--- {np_path.stem} (nanoembed) ---")
-        t0 = time.perf_counter()
-
-        import nanoembed
-        nm = nanoembed.load(str(np_path))
-        wrapper = MTEBModelWrapper(
-            nm.encode, model_name=f"nanoembed/{np_path.stem}",
-            size_mb=nm.info.logical_size_mb,
-        )
-        scores = _score_with_mteb(wrapper, tasks, results_dir / np_path.stem)
-        elapsed = time.perf_counter() - t0
-
-        avg = float(np.mean(list(scores.values()))) if scores else 0.0
-        run.log(f"  avg: {avg:.4f}  ({elapsed:.1f}s)")
-        for task, score in sorted(scores.items()):
-            run.log(f"    {task}: {score:.4f}")
-
-        flat = {"mteb_avg": avg, "eval_s": elapsed, **scores}
-        run.add_result(RunResult(
-            name=np_path.stem, size_mb=nm.info.logical_size_mb,
-            metrics=flat, provenance=[np_path.stem],
-        ))
-
-    # ── Score model2vec baselines ────────────────────────────────────────────
-    for m2v_id in args.include_m2v:
-        run.log(f"\n--- {m2v_id} (native m2v) ---")
-        t0 = time.perf_counter()
-
-        from evaluate.encoders import make_m2v_native_encoder
-        encoder, size_mb = make_m2v_native_encoder(m2v_id)
-
-        wrapper = MTEBModelWrapper(encoder, model_name=m2v_id, size_mb=size_mb)
-        scores = _score_with_mteb(wrapper, tasks, results_dir / m2v_id.replace("/", "_"))
-        elapsed = time.perf_counter() - t0
-
-        avg = float(np.mean(list(scores.values()))) if scores else 0.0
-        run.log(f"  avg: {avg:.4f}  ({elapsed:.1f}s)")
-        for task, score in sorted(scores.items()):
-            run.log(f"    {task}: {score:.4f}")
-
-        flat = {"mteb_avg": avg, "eval_s": elapsed, **scores}
-        run.add_result(RunResult(
-            name=m2v_id, size_mb=size_mb, metrics=flat, provenance=[m2v_id],
-        ))
-
-    # ── Summary table ────────────────────────────────────────────────────────
+    # ── Summary table ─────────────────────────────────────────────────────────
     run.log(f"\n{'='*80}")
     run.log(f"MTEB {args.tasks} summary")
     run.log(f"{'='*80}\n")
