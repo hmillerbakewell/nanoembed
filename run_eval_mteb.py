@@ -79,18 +79,32 @@ TASK_SETS: dict[str, list[str]] = {
     ],
 }
 
+# MMTEB benchmarks — loaded via mteb.get_benchmark() instead of task name lists.
+BENCHMARKS: dict[str, str] = {
+    "eng-v2": "MTEB(eng, v2)",
+    "multilingual": "MTEB(Multilingual, v1)",
+}
+
+ALL_TASK_CHOICES = list(TASK_SETS.keys()) + list(BENCHMARKS.keys())
+
+
+def _resolve_tasks(task_set: str):
+    """Resolve a task set name to mteb task objects."""
+    if task_set in BENCHMARKS:
+        benchmark = mteb.get_benchmark(BENCHMARKS[task_set])
+        return benchmark.tasks
+    return mteb.get_tasks(tasks=TASK_SETS[task_set])
+
 
 def _score_with_mteb(
     wrapper: MTEBModelWrapper,
-    task_names: list[str],
+    tasks,
     output_dir: Path,
 ) -> dict[str, float]:
     """Run MTEB tasks and return {task_name: main_score} dict."""
-
-    tasks = mteb.get_tasks(tasks=task_names)
     result = mteb.evaluate(
         wrapper,
-        tasks=tasks,
+        tasks,
         prediction_folder=str(output_dir),
         overwrite_strategy="always",
     )
@@ -119,15 +133,17 @@ def main() -> None:
                         help="Pipeline .pt checkpoint path(s) or glob(s)")
     parser.add_argument("--nanoembed", nargs="*", default=[],
                         help="Packed .npz model path(s) or glob(s)")
-    parser.add_argument("--tasks", default="sts", choices=list(TASK_SETS.keys()),
-                        help="Task set to evaluate (default: sts)")
+    parser.add_argument("--tasks", default="sts", choices=ALL_TASK_CHOICES,
+                        help="Task set to evaluate (default: sts). "
+                             "eng-v2 and multilingual use MMTEB benchmarks.")
     parser.add_argument("--include-m2v", nargs="*", default=[],
                         help="model2vec model IDs to include as baselines")
     parser.add_argument("--tag", default=None,
                         help="Filter checkpoints by filename prefix")
     args = parser.parse_args()
 
-    task_names = TASK_SETS[args.tasks]
+    tasks = _resolve_tasks(args.tasks)
+    task_names = [t.metadata.name for t in tasks]
 
     # Expand globs for .pt checkpoints
     paths: list[Path] = []
@@ -177,7 +193,7 @@ def main() -> None:
         encoder = make_local_encoder(model, max_length=256)
         wrapper = MTEBModelWrapper(encoder, model_name="healthdataavatar/"+path.stem, size_mb=model.size_mb)
 
-        scores = _score_with_mteb(wrapper, task_names, results_dir / path.stem)
+        scores = _score_with_mteb(wrapper, tasks, results_dir / path.stem)
         elapsed = time.perf_counter() - t0
 
         avg = float(np.mean(list(scores.values()))) if scores else 0.0
@@ -204,7 +220,7 @@ def main() -> None:
             nm.encode, model_name=f"nanoembed/{np_path.stem}",
             size_mb=nm.info.logical_size_mb,
         )
-        scores = _score_with_mteb(wrapper, task_names, results_dir / np_path.stem)
+        scores = _score_with_mteb(wrapper, tasks, results_dir / np_path.stem)
         elapsed = time.perf_counter() - t0
 
         avg = float(np.mean(list(scores.values()))) if scores else 0.0
@@ -227,7 +243,7 @@ def main() -> None:
         encoder, size_mb = make_m2v_native_encoder(m2v_id)
 
         wrapper = MTEBModelWrapper(encoder, model_name=m2v_id, size_mb=size_mb)
-        scores = _score_with_mteb(wrapper, task_names, results_dir / m2v_id.replace("/", "_"))
+        scores = _score_with_mteb(wrapper, tasks, results_dir / m2v_id.replace("/", "_"))
         elapsed = time.perf_counter() - t0
 
         avg = float(np.mean(list(scores.values()))) if scores else 0.0
