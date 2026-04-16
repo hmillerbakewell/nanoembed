@@ -2,29 +2,29 @@
 
 Two modes:
   - **rerank** (default): rank ~30K pre-annotated passages per language. Fast.
-  - **full** (--full): stream entire corpus, running top-K. Actual MIRACL protocol.
+  - **full**: stream entire corpus, running top-K. Actual MIRACL protocol.
 
 Usage:
-    python run_eval_miracl.py --checkpoint "checkpoints/*.pt" --language ar
-    python run_eval_miracl.py --checkpoint "checkpoints/*.pt" --all-languages
-    python run_eval_miracl.py --checkpoint "checkpoints/*.pt" --language ar --full
-    python run_eval_miracl.py --checkpoint "checkpoints/*.pt" --include-m2v minishlab/potion-multilingual-128M
+    python run_eval_miracl.py --model checkpoint.pt --languages ar
+    python run_eval_miracl.py --model model.npz org/model-name --languages all
+    python run_eval_miracl.py --model model.npz --languages ar sw fi --mode full
 """
 
 
 import argparse
 import time
+from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
 
 import numpy as np
 
 from evaluate.metrics import (
+    Encoder,
     evaluate_miracl,
     evaluate_miracl_full,
     make_local_encoder,
 )
-from models.io import load_model
 from evaluate.miracl import MiraclEvalSet, load_miracl
 from evaluate.results import Run, RunResult
 
@@ -36,32 +36,69 @@ ALL_MIRACL_NON_EN: tuple[str, ...] = (
 )
 
 
-def _score_rerank_encoder(
-    name: str,
-    encoder,
-    size_mb: float,
+@dataclass
+class LoadedModel:
+    """A model ready for evaluation."""
+    name: str
+    encoder: Encoder
+    size_mb: float
+    provenance: list[str]
+
+
+def load_any_model(path_or_id: str) -> LoadedModel:
+    """Load a model from any supported source.
+
+    - .pt file  → pytorch checkpoint (via models.io)
+    - .npz file → nanoembed packed format
+    - otherwise → model2vec from HuggingFace
+    """
+    p = Path(path_or_id)
+
+    if p.suffix == ".pt" and p.exists():
+        from models.io import load_model
+        model = load_model(p)
+        encoder = make_local_encoder(model, max_length=256)
+        return LoadedModel(
+            name=p.stem, encoder=encoder,
+            size_mb=model.size_mb, provenance=model.provenance,
+        )
+
+    if p.suffix == ".npz" and p.exists():
+        import nanoembed
+        nm = nanoembed.load(str(p))
+        return LoadedModel(
+            name=p.stem, encoder=nm.encode,
+            size_mb=nm.info.logical_size_mb, provenance=[p.stem],
+        )
+
+    # HuggingFace model2vec
+    from evaluate.encoders import make_m2v_native_encoder
+    encoder, size_mb = make_m2v_native_encoder(path_or_id)
+    return LoadedModel(
+        name=path_or_id, encoder=encoder,
+        size_mb=size_mb, provenance=[path_or_id],
+    )
+
+
+def _score_rerank(
+    model: LoadedModel,
     languages: list[str],
     eval_sets: dict[str, MiraclEvalSet],
     run: Run,
-    provenance: list[str] | None = None,
 ) -> None:
-    """Rerank-style eval for any encoder callable."""
-    run.log(f"\n--- {name} ---")
+    """Rerank-style eval for a loaded model."""
+    run.log(f"\n--- {model.name} ---")
     t0 = time.perf_counter()
 
     per_lang: dict[str, dict[str, float]] = {}
-    per_lang_times: dict[str, float] = {}
     for lang in languages:
-        t_lang = time.perf_counter()
-        per_lang[lang] = evaluate_miracl(encoder, eval_sets[lang])
-        per_lang_times[lang] = time.perf_counter() - t_lang
+        per_lang[lang] = evaluate_miracl(model.encoder, eval_sets[lang])
 
     eval_s = time.perf_counter() - t0
 
     macro_ndcg = float(np.mean([per_lang[l]["ndcg@10"] for l in languages]))
     macro_r10 = float(np.mean([per_lang[l]["recall@10"] for l in languages]))
     macro_r3 = float(np.mean([per_lang[l]["recall@3"] for l in languages]))
-    total_queries = int(sum(per_lang[l]["num_queries"] for l in languages))
 
     run.log(f"  nDCG@10={macro_ndcg:.4f}  R@10={macro_r10:.4f}  ({eval_s:.1f}s)")
 
@@ -75,24 +112,13 @@ def _score_rerank_encoder(
         flat[f"ndcg@10_{lang}"] = per_lang[lang]["ndcg@10"]
 
     run.add_result(RunResult(
-        name=name, size_mb=size_mb, metrics=flat,
-        provenance=provenance or [name],
+        name=model.name, size_mb=model.size_mb, metrics=flat,
+        provenance=model.provenance,
     ))
 
 
-def _score_rerank(path, languages, eval_sets, run):
-    """Load a checkpoint and score it via rerank."""
-    model = load_model(path)
-    encoder = make_local_encoder(model, max_length=256)
-    _score_rerank_encoder(
-        name=path.stem, encoder=encoder, size_mb=model.size_mb,
-        languages=languages, eval_sets=eval_sets, run=run,
-        provenance=model.provenance,
-    )
-
-
 def _score_full(
-    path: Path,
+    model: LoadedModel,
     languages: list[str],
     run: Run,
     data_dir: str,
@@ -100,12 +126,8 @@ def _score_full(
     top_k: int,
 ) -> None:
     """Full-corpus eval: stream the corpus per language, running top-K per query."""
-    run.log(f"\n--- {path.name} ---")
-    t_load = time.perf_counter()
-    model = load_model(path)
-    encoder = make_local_encoder(model, max_length=256)
-    t_eval_start = time.perf_counter()
-    load_s = t_eval_start - t_load
+    run.log(f"\n--- {model.name} ---")
+    t0 = time.perf_counter()
 
     per_lang: dict[str, dict[str, float]] = {}
     per_lang_times: dict[str, float] = {}
@@ -114,7 +136,7 @@ def _score_full(
         t_lang = time.perf_counter()
         try:
             per_lang[lang] = evaluate_miracl_full(
-                encoder=encoder,
+                encoder=model.encoder,
                 language=lang,
                 data_dir=data_dir,
                 batch_size=batch_size,
@@ -132,7 +154,7 @@ def _score_full(
             f"{per_lang_times[lang]:.1f}s)"
         )
 
-    eval_s = time.perf_counter() - t_eval_start
+    eval_s = time.perf_counter() - t0
 
     if not per_lang:
         run.log("  no languages scored")
@@ -157,7 +179,6 @@ def _score_full(
         "num_languages": float(len(scored_langs)),
         "total_queries": float(total_queries),
         "total_passages": float(total_passages),
-        "load_s": load_s,
         "eval_s": eval_s,
         "mode": 1.0,
     }
@@ -168,79 +189,64 @@ def _score_full(
         flat[f"eval_s_{lang}"] = per_lang_times[lang]
 
     run.add_result(RunResult(
-        name=path.stem,
-        size_mb=model.size_mb,
-        metrics=flat,
+        name=model.name, size_mb=model.size_mb, metrics=flat,
         provenance=model.provenance,
     ))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", nargs="+", default=[],
-                        help="Pipeline .pt checkpoint path(s) or glob(s)")
-    parser.add_argument("--language", nargs="+", default=["ar"],
-                        help="MIRACL language code(s). Default: ar")
-    parser.add_argument("--all-languages", action="store_true",
-                        help=f"Shortcut for 15 non-English MIRACL languages: "
-                             f"{' '.join(ALL_MIRACL_NON_EN)}")
-    parser.add_argument("--full", action="store_true",
-                        help="Full-corpus retrieval (streaming). Default: rerank-style.")
+    parser = argparse.ArgumentParser(
+        description="Score static models on MIRACL multilingual retrieval",
+    )
+    parser.add_argument(
+        "--model", nargs="+", required=True,
+        help="Model(s) to evaluate: .pt checkpoint, .npz nanoembed file, "
+             "or HuggingFace model ID. Globs are expanded.",
+    )
+    parser.add_argument(
+        "--languages", nargs="+", default=["ar"],
+        help="MIRACL language code(s), or 'all' for 15 non-English languages. "
+             "Default: ar",
+    )
+    parser.add_argument(
+        "--mode", choices=["rerank", "full"], default="rerank",
+        help="rerank (fast, ~30K passages) or full (stream entire corpus). "
+             "Default: rerank",
+    )
     parser.add_argument("--data-dir", default="data",
                         help="Root of the data directory")
     parser.add_argument("--batch-size", type=int, default=10_000,
-                        help="Full-corpus mode: passages encoded per batch (default 10000)")
+                        help="Full mode: passages encoded per batch (default 10000)")
     parser.add_argument("--top-k", type=int, default=100,
-                        help="Full-corpus mode: running top-K per query (default 100)")
-    parser.add_argument("--nanoembed", nargs="*", default=[],
-                        help="Packed .npz model path(s) or glob(s) to evaluate")
-    parser.add_argument("--include-m2v", nargs="*", default=[],
-                        help="model2vec model IDs to include as baselines")
-    parser.add_argument("--tag", default=None,
-                        help="Filter to checkpoints whose filename starts with this tag")
+                        help="Full mode: running top-K per query (default 100)")
     args = parser.parse_args()
 
     # Resolve language list
-    languages: list[str]
-    if args.all_languages:
+    if args.languages == ["all"]:
         languages = list(ALL_MIRACL_NON_EN)
     else:
-        languages = list(args.language)
+        languages = list(args.languages)
 
-    # Expand globs for .pt checkpoints
-    paths: list[Path] = []
-    for pattern in args.checkpoint:
-        matches = sorted(Path(p) for p in glob(pattern))
-        if not matches:
-            print(f"Warning: no matches for {pattern}")
-        paths.extend(matches)
+    # Expand globs and resolve models
+    model_specs: list[str] = []
+    for pattern in args.model:
+        matches = sorted(glob(pattern))
+        if matches and matches != [pattern]:
+            model_specs.extend(matches)
+        else:
+            model_specs.append(pattern)
 
-    if args.tag:
-        prefix = f"{args.tag}_"
-        paths = [p for p in paths if p.stem.startswith(prefix)]
-        print(f"Filtered to {len(paths)} checkpoints with tag '{args.tag}'")
-
-    # Expand globs for .npz nanoembed models
-    nano_paths: list[Path] = []
-    for pattern in args.nanoembed:
-        matches = sorted(Path(p) for p in glob(pattern))
-        if not matches:
-            print(f"Warning: no matches for {pattern}")
-        nano_paths.extend(matches)
-
-    if not paths and not nano_paths and not args.include_m2v:
+    if not model_specs:
         raise SystemExit("No models to evaluate")
 
-    mode_label = "full" if args.full else "rerank"
+    mode_label = args.mode
     if len(languages) == 1:
         lang_label = languages[0]
-    elif args.all_languages:
+    elif len(languages) == len(ALL_MIRACL_NON_EN):
         lang_label = "all"
     else:
         lang_label = "+".join(languages)
     label = f"miracl_{mode_label}_{lang_label}"
-    if args.tag:
-        label += f"_{args.tag}"
 
     run = Run(
         label=label,
@@ -248,18 +254,28 @@ def main() -> None:
             "kind": "miracl_eval",
             "mode": mode_label,
             "languages": languages,
-            "tag": args.tag,
-            "num_checkpoints": len(paths),
-            "checkpoints": [str(p) for p in paths],
+            "models": model_specs,
         },
     )
-    run.log(f"Mode:          {mode_label}")
-    run.log(f"Languages:     {' '.join(languages)}")
-    run.log(f"Checkpoints:   {len(paths)}")
-    run.log(f"Run directory: {run.dir}")
+    run.log(f"Mode:       {mode_label}")
+    run.log(f"Languages:  {' '.join(languages)}")
+    run.log(f"Models:     {len(model_specs)}")
+    run.log(f"Run dir:    {run.dir}")
 
-    # ── Rerank mode: pre-load all eval sets ──────────────────────────────────
-    if not args.full:
+    # Load all models upfront
+    models: list[LoadedModel] = []
+    for spec in model_specs:
+        try:
+            models.append(load_any_model(spec))
+            run.log(f"  loaded {models[-1].name} ({models[-1].size_mb:.1f} MB)")
+        except Exception as e:
+            run.log(f"  failed to load {spec}: {e}")
+
+    if not models:
+        raise SystemExit("No models could be loaded")
+
+    # ── Rerank mode ───────────────────────────────────────────────────────────
+    if args.mode == "rerank":
         run.log(f"\nLoading {len(languages)} rerank eval set(s)...")
         t0 = time.perf_counter()
         eval_sets: dict[str, MiraclEvalSet] = {}
@@ -280,39 +296,16 @@ def main() -> None:
                 f"({load_all_s:.2f}s)")
 
         languages = list(eval_sets.keys())  # drop ones that failed
-        for path in paths:
-            _score_rerank(path, languages, eval_sets, run)
+        for m in models:
+            _score_rerank(m, languages, eval_sets, run)
 
-        # nanoembed models (rerank)
-        for np_path in nano_paths:
-            import nanoembed
-            nm = nanoembed.load(str(np_path))
-            _score_rerank_encoder(
-                name=np_path.stem, encoder=nm.encode, size_mb=nm.info.logical_size_mb,
-                languages=languages, eval_sets=eval_sets, run=run,
-            )
-
-        # m2v baselines (rerank)
-        if args.include_m2v:
-            from evaluate.encoders import make_m2v_native_encoder
-            for m2v_id in args.include_m2v:
-                try:
-                    encoder, size_mb = make_m2v_native_encoder(m2v_id)
-                except Exception as e:
-                    run.log(f"\nFailed to load {m2v_id}: {e}")
-                    continue
-                _score_rerank_encoder(
-                    name=m2v_id, encoder=encoder, size_mb=size_mb,
-                    languages=languages, eval_sets=eval_sets, run=run,
-                )
-
-    # ── Full-corpus mode: stream per checkpoint, per language ────────────────
+    # ── Full-corpus mode ──────────────────────────────────────────────────────
     else:
-        run.log(f"\nFull-corpus mode: streaming each language's corpus per checkpoint.")
+        run.log(f"\nFull-corpus mode: streaming each language's corpus per model.")
         run.log(f"Batch size: {args.batch_size}, top-K: {args.top_k}")
-        for path in paths:
+        for m in models:
             _score_full(
-                path=path,
+                model=m,
                 languages=languages,
                 run=run,
                 data_dir=args.data_dir,
@@ -320,14 +313,13 @@ def main() -> None:
                 top_k=args.top_k,
             )
 
-    # ── Summary table ────────────────────────────────────────────────────────
+    # ── Summary table ─────────────────────────────────────────────────────────
     run.log(f"\n{'='*120}")
     run.log(f"MIRACL summary — {mode_label}, {len(languages)} language(s), macro-averaged")
     run.log(f"{'='*120}\n")
 
-    if args.full:
-        # Full-corpus table: macro nDCG@10, recall@100, per-lang nDCG@10
-        header_macro = (f"{'Checkpoint':<55} {'MB':>8} {'macro':>7} "
+    if args.mode == "full":
+        header_macro = (f"{'Model':<55} {'MB':>8} {'macro':>7} "
                         f"{'R@100':>8} {'eval_s':>8} ")
         header_langs = "  ".join(f"{l:>5}" for l in languages)
         run.log(header_macro + header_langs)
@@ -342,14 +334,14 @@ def main() -> None:
             )
             run.log(macro_block + per_lang_block)
     elif len(languages) == 1:
-        run.log(f"{'Checkpoint':<55} {'MB':>8} {'nDCG@10':>9} {'R@10':>8} {'R@3':>8} {'eval_s':>8}")
+        run.log(f"{'Model':<55} {'MB':>8} {'nDCG@10':>9} {'R@10':>8} {'R@3':>8} {'eval_s':>8}")
         run.log("-" * 110)
         for r in run.results:
             run.log(f"{r.name:<55} {r.size_mb:>8.2f} {r.metrics['ndcg@10']:>9.4f} "
                     f"{r.metrics['recall@10']:>8.4f} {r.metrics['recall@3']:>8.4f} "
                     f"{r.metrics.get('eval_s', 0.0):>8.2f}")
     else:
-        header_macro = f"{'Checkpoint':<55} {'MB':>8} {'macro':>7} {'R@10':>8} {'R@3':>8} {'eval_s':>8} "
+        header_macro = f"{'Model':<55} {'MB':>8} {'macro':>7} {'R@10':>8} {'R@3':>8} {'eval_s':>8} "
         header_langs = "  ".join(f"{l:>5}" for l in languages)
         run.log(header_macro + header_langs)
         run.log("-" * (len(header_macro) + len(header_langs)))

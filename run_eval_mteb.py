@@ -96,7 +96,7 @@ def _score_with_mteb(
     )
 
     scores: dict[str, float] = {}
-    for task_result in results:
+    for task_result in result.task_results:
         task_name = task_result.task_name
         # MTEB stores the main score in the test split's main_score
         for split_name, split_scores in task_result.scores.items():
