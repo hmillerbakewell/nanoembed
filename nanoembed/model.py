@@ -63,7 +63,7 @@ class Model:
         self._source_model = source_model
 
     @classmethod
-    def load(cls, path: str | Path) -> Model:
+    def load(cls, path: str | Path) -> "Model":
         """Load from a packed .npz checkpoint.
 
         The tokenizer is fetched from HuggingFace by the name stored in the
