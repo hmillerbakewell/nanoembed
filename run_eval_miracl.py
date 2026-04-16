@@ -296,7 +296,9 @@ def main() -> None:
             models.append(load_any_model(spec))
             run.log(f"  loaded {models[-1].name} ({models[-1].size_mb:.1f} MB)")
         except Exception as e:
+            import traceback
             run.log(f"  failed to load {spec}: {e}")
+            traceback.print_exc()
 
     if not models:
         raise SystemExit("No models could be loaded")
