@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
 
+from tqdm import tqdm
+
 import numpy as np
 
 from evaluate.metrics import (
@@ -91,7 +93,7 @@ def _score_rerank(
     t0 = time.perf_counter()
 
     per_lang: dict[str, dict[str, float]] = {}
-    for lang in languages:
+    for lang in tqdm(languages, desc=f"  {model.name}", unit="lang"):
         per_lang[lang] = evaluate_miracl(model.encoder, eval_sets[lang])
 
     eval_s = time.perf_counter() - t0
@@ -125,14 +127,33 @@ def _score_full(
     batch_size: int,
     top_k: int,
 ) -> None:
-    """Full-corpus eval: stream the corpus per language, running top-K per query."""
+    """Full-corpus eval: stream the corpus per language, running top-K per query.
+
+    Results are checkpointed per-language to {data_dir}/miracl_full_progress/{model.name}.json.
+    Re-running the same command automatically resumes where it left off.
+    """
+    import json
+
     run.log(f"\n--- {model.name} ---")
     t0 = time.perf_counter()
 
+    # Load checkpoint if resuming
+    progress_dir = Path(data_dir) / "miracl_full_progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = progress_dir / f"{model.name}.json"
     per_lang: dict[str, dict[str, float]] = {}
     per_lang_times: dict[str, float] = {}
-    for lang in languages:
-        run.log(f"  [{lang}] streaming corpus...")
+    if progress_path.exists():
+        saved = json.loads(progress_path.read_text())
+        per_lang = saved.get("per_lang", {})
+        per_lang_times = saved.get("per_lang_times", {})
+        run.log(f"  resuming: {len(per_lang)} languages already done")
+
+    remaining = [l for l in languages if l not in per_lang]
+    lang_iter = tqdm(remaining, desc=f"  {model.name}", unit="lang",
+                     initial=len(per_lang), total=len(languages))
+    for lang in lang_iter:
+        lang_iter.set_postfix(lang=lang)
         t_lang = time.perf_counter()
         try:
             per_lang[lang] = evaluate_miracl_full(
@@ -153,6 +174,12 @@ def _score_full(
             f"({int(scores['total_passages']):,} passages, "
             f"{per_lang_times[lang]:.1f}s)"
         )
+
+        # Checkpoint after each language
+        progress_path.write_text(json.dumps({
+            "per_lang": per_lang,
+            "per_lang_times": per_lang_times,
+        }, indent=2))
 
     eval_s = time.perf_counter() - t0
 
